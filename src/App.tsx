@@ -1,6 +1,7 @@
 import { useEffect, useRef, useState } from 'react'
 import Peer, { type DataConnection, type MediaConnection } from 'peerjs'
 import { QRCodeSVG } from 'qrcode.react'
+import { FaceDetector, FilesetResolver } from '@mediapipe/tasks-vision'
 
 type Effect = {
   id: number
@@ -10,24 +11,152 @@ type Effect = {
 
 const targetPcId = new URLSearchParams(window.location.search).get('pc')
 
+let detectorPromise: Promise<FaceDetector> | null = null
+
+function getDetector() {
+  if (!detectorPromise) {
+    detectorPromise = FilesetResolver.forVisionTasks(
+      'https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@latest/wasm',
+    ).then((fileset) =>
+      FaceDetector.createFromOptions(fileset, {
+        baseOptions: {
+          modelAssetPath:
+            'https://storage.googleapis.com/mediapipe-models/face_detector/blaze_face_short_range/float16/1/blaze_face_short_range.tflite',
+          delegate: 'GPU',
+        },
+        runningMode: 'VIDEO',
+      }),
+    )
+  }
+  return detectorPromise
+}
+
+function drawSunglasses(
+  ctx: CanvasRenderingContext2D,
+  ax: number,
+  ay: number,
+  bx: number,
+  by: number,
+) {
+  if (ax > bx) {
+    ;[ax, bx] = [bx, ax]
+    ;[ay, by] = [by, ay]
+  }
+  const d = Math.hypot(bx - ax, by - ay)
+  const cx = (ax + bx) / 2
+  const cy = (ay + by) / 2
+  const angle = Math.atan2(by - ay, bx - ax)
+  const lensW = d * 0.9
+  const lensH = d * 0.6
+
+  ctx.save()
+  ctx.translate(cx, cy)
+  ctx.rotate(angle)
+
+  ctx.fillStyle = 'rgba(10, 10, 10, 0.92)'
+  for (const side of [-1, 1]) {
+    ctx.beginPath()
+    ctx.roundRect(side * (d / 2) - lensW / 2, -lensH / 2, lensW, lensH, lensH * 0.4)
+    ctx.fill()
+  }
+
+  ctx.strokeStyle = '#111'
+  ctx.lineWidth = Math.max(2, d * 0.08)
+  ctx.beginPath()
+  ctx.moveTo(-d / 2 + lensW / 2, -lensH * 0.2)
+  ctx.lineTo(d / 2 - lensW / 2, -lensH * 0.2)
+  ctx.stroke()
+
+  ctx.fillStyle = 'rgba(255, 255, 255, 0.3)'
+  for (const side of [-1, 1]) {
+    ctx.beginPath()
+    ctx.ellipse(side * (d / 2) - lensW * 0.2, -lensH * 0.15, lensW * 0.12, lensH * 0.08, -0.4, 0, Math.PI * 2)
+    ctx.fill()
+  }
+
+  ctx.restore()
+}
+
 function VideoPanel({
   stream,
   effects,
   muted = false,
+  sunglasses = false,
   onTap,
 }: {
   stream: MediaStream | null
   effects: Effect[]
   muted?: boolean
+  sunglasses?: boolean
   onTap?: () => void
 }) {
   const videoRef = useRef<HTMLVideoElement>(null)
+  const canvasRef = useRef<HTMLCanvasElement>(null)
 
   useEffect(() => {
     if (videoRef.current) {
       videoRef.current.srcObject = stream
     }
   }, [stream])
+
+  useEffect(() => {
+    const clear = () => {
+      const canvas = canvasRef.current
+      canvas?.getContext('2d')?.clearRect(0, 0, canvas.width, canvas.height)
+    }
+
+    if (!sunglasses) {
+      clear()
+      return
+    }
+
+    let stopped = false
+    let rafId = 0
+
+    getDetector().then((detector) => {
+      const loop = () => {
+        if (stopped) return
+        const video = videoRef.current
+        const canvas = canvasRef.current
+        const ctx = canvas?.getContext('2d')
+
+        if (video && canvas && ctx && video.readyState >= 2 && video.videoWidth > 0) {
+          const cw = canvas.clientWidth
+          const ch = canvas.clientHeight
+          if (canvas.width !== cw) canvas.width = cw
+          if (canvas.height !== ch) canvas.height = ch
+          ctx.clearRect(0, 0, cw, ch)
+
+          const vw = video.videoWidth
+          const vh = video.videoHeight
+          const scale = Math.max(cw / vw, ch / vh)
+          const ox = (cw - vw * scale) / 2
+          const oy = (ch - vh * scale) / 2
+
+          const result = detector.detectForVideo(video, performance.now())
+          for (const detection of result.detections) {
+            const [eye1, eye2] = detection.keypoints
+            if (!eye1 || !eye2) continue
+            drawSunglasses(
+              ctx,
+              ox + eye1.x * vw * scale,
+              oy + eye1.y * vh * scale,
+              ox + eye2.x * vw * scale,
+              oy + eye2.y * vh * scale,
+            )
+          }
+        }
+        rafId = requestAnimationFrame(loop)
+      }
+      loop()
+    })
+
+    return () => {
+      stopped = true
+      cancelAnimationFrame(rafId)
+      clear()
+    }
+  }, [sunglasses])
 
   return (
     <div
@@ -41,6 +170,7 @@ function VideoPanel({
         muted={muted}
         className="aspect-video w-full object-cover"
       />
+      <canvas ref={canvasRef} className="pointer-events-none absolute inset-0 h-full w-full" />
       {effects.map((effect) => (
         <span
           key={effect.id}
@@ -58,6 +188,7 @@ function PcView() {
   const [myId, setMyId] = useState('')
   const [streams, setStreams] = useState<Record<string, MediaStream>>({})
   const [effects, setEffects] = useState<Record<string, Effect[]>>({})
+  const [sunglasses, setSunglasses] = useState(false)
 
   useEffect(() => {
     const peer = new Peer()
@@ -128,6 +259,12 @@ function PcView() {
           <p>Peer ID：{myId || '取得中…'}</p>
           <p>接続台数：{peerIds.length}台</p>
           <p className="text-sm text-slate-400">スマホでQRコードを読み取ってください</p>
+          <button
+            onClick={() => setSunglasses((v) => !v)}
+            className={`rounded-lg px-4 py-2 font-bold ${sunglasses ? 'bg-yellow-400 text-black' : 'bg-slate-700'}`}
+          >
+            😎 サングラス {sunglasses ? 'ON' : 'OFF'}
+          </button>
         </div>
       </div>
 
@@ -137,6 +274,7 @@ function PcView() {
             key={peerId}
             stream={streams[peerId]}
             effects={effects[peerId] ?? []}
+            sunglasses={sunglasses}
             muted
           />
         ))}
