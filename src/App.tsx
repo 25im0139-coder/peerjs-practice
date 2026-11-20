@@ -300,7 +300,7 @@ function PhoneView({ target }: { target: string }) {
     }
 
     navigator.mediaDevices
-      .getUserMedia({ video: { facingMode: 'environment' }, audio: false })
+      .getUserMedia({ video: { facingMode: 'user' }, audio: false })
       .then((s) => {
         if (cancelled) {
           s.getTracks().forEach((t) => t.stop())
